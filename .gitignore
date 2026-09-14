@@ -1,0 +1,41 @@
+# Environment
+.env
+.env.local
+*.pyc
+__pycache__/
+*.egg-info/
+.Python
+venv/
+ENV/
+
+# Models and data
+models/*.gguf
+models/*.bin
+data/tyla.db
+data/*.sqlite
+knowledge/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Sandbox
+sandbox/
+!sandbox/.gitkeep
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# API keys and secrets
+.secrets/
+keys/
