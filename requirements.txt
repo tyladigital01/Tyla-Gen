@@ -4,17 +4,14 @@ uvicorn[standard]==0.24.0
 python-dotenv==1.0.0
 pydantic==2.5.0
 
-# LLM Inference
+# LLM Inference - llama-cpp-python with proper build
 llama-cpp-python==0.2.20
-onnxruntime==1.16.3
 
-# Data & Storage
+# Data & Storage - sqlite3 is built-in, no need to install
 sqlalchemy==2.0.23
-sqlite3-python==1.0.0
 
 # Text Processing
 nltk==3.8.1
-fuzzy-string-matching==0.0.2
 
 # Web
 aiofiles==23.2.1
@@ -25,7 +22,7 @@ click==8.1.7
 tabulate==0.9.0
 colorama==0.4.6
 
-# Development
+# Development & Testing
 pytest==7.4.3
 pytest-asyncio==0.21.1
 black==23.12.0
@@ -34,4 +31,4 @@ flake8==6.1.0
 # Utilities
 python-dateutil==2.8.2
 requests==2.31.0
-jinja2==3.1.2
+psutil==5.9.6
