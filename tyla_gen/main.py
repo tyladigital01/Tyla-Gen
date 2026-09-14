@@ -1,14 +1,17 @@
-"""FastAPI server for Tyla-Gen."""
+"""FastAPI server for Tyla-Gen - Fixed version with CLI support."""
 
 import os
+import sys
+import argparse
 import logging
 from typing import List, Optional
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Depends, Header
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from pathlib import Path
 import uvicorn
 
 from .model import ModelManager
@@ -21,22 +24,39 @@ from .auth import verify_api_key
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/tyla.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
 # Initialize components
+logger.info("Initializing Tyla-Gen components...")
 model_manager = ModelManager()
 memory_manager = MemoryManager()
 rag_engine = RAGEngine(memory_manager=memory_manager)
 chat_engine = ChatEngine(model_manager, memory_manager=memory_manager)
 agent_engine = AgentEngine(model_manager, memory_manager=memory_manager, owner_id=os.getenv("TYLA_OWNER_ID", "default"))
 
+# Load model at startup
+logger.info("Loading model configuration...")
+model_manager.select_model()
+logger.info(f"Selected model: {model_manager.model_config['name']}")
+
+if model_manager.load_model():
+    logger.info("Model loaded successfully")
+else:
+    logger.warning("Model failed to load - will attempt to load on first request")
+
 # FastAPI app
 app = FastAPI(
     title="Tyla-Gen",
     description="All-in-One AI Server Running in GitHub Codespaces",
-    version="1.0.0"
+    version="1.0.0",
+    docs_url="/docs",
+    openapi_url="/openapi.json"
 )
 
 # ============================================================================
@@ -88,7 +108,11 @@ async def get_api_key(authorization: Optional[str] = Header(None)) -> str:
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     
-    token = authorization.split(" ")[1]
+    try:
+        token = authorization.split(" ")[1]
+    except IndexError:
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    
     if not verify_api_key(token):
         raise HTTPException(status_code=401, detail="Invalid API key")
     
@@ -106,7 +130,8 @@ async def health():
     return {
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
-        "service": "Tyla-Gen"
+        "service": "Tyla-Gen",
+        "version": "1.0.0"
     }
 
 
@@ -114,11 +139,23 @@ async def health():
 async def index():
     """Serve web UI."""
     try:
-        from pathlib import Path
         ui_path = Path(__file__).parent.parent / "web" / "index.html"
-        return ui_path.read_text()
-    except:
-        return "<h1>Tyla-Gen Web UI</h1><p>Open this URL in your browser for the interactive interface.</p>"
+        if ui_path.exists():
+            return ui_path.read_text()
+    except Exception as e:
+        logger.error(f"Failed to load UI: {e}")
+    
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head><title>Tyla-Gen</title></head>
+    <body>
+        <h1>🧠 Tyla-Gen</h1>
+        <p>All-in-One AI Server Running in GitHub Codespaces</p>
+        <p><a href="/docs">API Documentation</a></p>
+    </body>
+    </html>
+    """
 
 
 # ============================================================================
@@ -150,11 +187,12 @@ async def list_models(api_key: str = Depends(get_api_key)):
         "current_model": status_info["model"],
         "model_loaded": status_info["loaded"],
         "inference_engine": "llama-cpp-python",
+        "local_inference": True,
         "hardware": status_info["hardware"],
         "available_models": [
-            {"name": "phi-2", "size_gb": 4.7, "quantization": "q4_k_m"},
-            {"name": "mistral-7b", "size_gb": 7.0, "quantization": "q4_k_m"},
-            {"name": "neural-chat", "size_gb": 3.5, "quantization": "q4_k_m"},
+            {"name": "phi-2", "size_gb": 4.7, "quantization": "q4_k_m", "min_ram": 6},
+            {"name": "mistral-7b", "size_gb": 7.0, "quantization": "q4_k_m", "min_ram": 8},
+            {"name": "neural-chat", "size_gb": 3.5, "quantization": "q4_k_m", "min_ram": 5},
         ]
     }
 
@@ -168,9 +206,11 @@ async def list_models(api_key: str = Depends(get_api_key)):
 async def chat_completion(request: ChatCompletionRequest, api_key: str = Depends(get_api_key)):
     """Process chat completion using local model."""
     try:
-        # Validate model is loaded
+        # Ensure model is loaded
         if not model_manager.current_model:
-            raise HTTPException(status_code=503, detail="Model not loaded")
+            logger.info("Model not in memory, attempting to load...")
+            if not model_manager.load_model():
+                raise HTTPException(status_code=503, detail="Model failed to load")
         
         # Get last user message
         user_message = None
@@ -190,6 +230,10 @@ async def chat_completion(request: ChatCompletionRequest, api_key: str = Depends
             temperature=request.temperature or 0.7,
             top_p=request.top_p or 0.95,
         )
+        
+        # Log to memory
+        memory_manager.log_message("user", user_message)
+        memory_manager.log_message("assistant", response)
         
         return {
             "id": f"tyla-{int(datetime.now().timestamp() * 1000)}",
@@ -215,7 +259,7 @@ async def chat_completion(request: ChatCompletionRequest, api_key: str = Depends
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Chat completion failed: {e}")
+        logger.error(f"Chat completion failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -229,7 +273,9 @@ async def agent_execution(request: AgentRequest, api_key: str = Depends(get_api_
     """Execute agent with tool use."""
     try:
         if not model_manager.current_model:
-            raise HTTPException(status_code=503, detail="Model not loaded")
+            logger.info("Model not in memory, attempting to load...")
+            if not model_manager.load_model():
+                raise HTTPException(status_code=503, detail="Model failed to load")
         
         logger.info(f"Agent task: {request.task}")
         result = agent_engine.execute(
@@ -249,7 +295,7 @@ async def agent_execution(request: AgentRequest, api_key: str = Depends(get_api_
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Agent execution failed: {e}")
+        logger.error(f"Agent execution failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -294,7 +340,7 @@ async def get_history(session_id: str = "default", api_key: str = Depends(get_ap
     """Get conversation history."""
     try:
         history = memory_manager.get_conversation_history(session_id)
-        return {"session_id": session_id, "messages": history}
+        return {"session_id": session_id, "messages": history, "count": len(history)}
     except Exception as e:
         logger.error(f"Failed to get history: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -311,22 +357,22 @@ async def clear_memory(session_id: str = "default", api_key: str = Depends(get_a
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ============================================================================
-# CLI Callback Endpoint
-# ============================================================================
-
-
-@app.get("/v1/cli/version")
-async def cli_version():
-    """Get Tyla-Gen version for CLI."""
-    return {"version": "1.0.0", "name": "Tyla-Gen"}
-
-
 def start_server(host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
     """Start the FastAPI server."""
     logger.info(f"Starting Tyla-Gen server on {host}:{port}")
+    print(f"\n{'='*60}")
+    print(f"🧠 Tyla-Gen Server Starting")
+    print(f"{'='*60}")
+    print(f"Local: http://localhost:{port}")
+    print(f"API: http://localhost:{port}/v1/chat/completions")
+    print(f"Docs: http://localhost:{port}/docs")
+    print(f"\nModel: {model_manager.model_config['name'] if model_manager.model_config else 'Loading...'}")
+    print(f"Engine: llama-cpp-python (CPU-only)")
+    print(f"Status: {'Ready' if model_manager.current_model else 'Loading model...'}")
+    print(f"{'='*60}\n")
+    
     uvicorn.run(
-        "tyla_gen.main:app",
+        app,
         host=host,
         port=port,
         reload=reload,
@@ -335,4 +381,10 @@ def start_server(host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
 
 
 if __name__ == "__main__":
-    start_server()
+    parser = argparse.ArgumentParser(description="Tyla-Gen FastAPI Server")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
+    parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
+    
+    args = parser.parse_args()
+    start_server(host=args.host, port=args.port, reload=args.reload)
